@@ -2,60 +2,6 @@ using TaskbarOpacityController;
 
 var tests = new (string Name, Action Run)[]
 {
-    ("desktop without hover fades target to hidden", () =>
-    {
-        var state = new DockStateMachine();
-
-        state.UpdateTarget(isDesktop: true, isHover: false);
-
-        AssertEqual((byte)0, state.TargetAlpha);
-    }),
-    ("active window keeps target visible", () =>
-    {
-        var state = new DockStateMachine();
-
-        state.UpdateTarget(isDesktop: false, isHover: false);
-
-        AssertEqual((byte)255, state.TargetAlpha);
-    }),
-    ("hover overrides desktop and forces visible target", () =>
-    {
-        var state = new DockStateMachine();
-
-        state.UpdateTarget(isDesktop: true, isHover: true);
-
-        AssertEqual((byte)255, state.TargetAlpha);
-    }),
-    ("fade out steps down without byte underflow", () =>
-    {
-        var state = new DockStateMachine();
-        state.UpdateTarget(isDesktop: true, isHover: false);
-
-        state.AnimateFrame();
-
-        AssertTrue(state.CurrentAlpha < 255, $"Expected alpha below 255, got {state.CurrentAlpha}.");
-    }),
-    ("fade animation reaches target without overshoot", () =>
-    {
-        var state = new DockStateMachine();
-        state.UpdateTarget(isDesktop: true, isHover: false);
-
-        for (var i = 0; i < 100; i++)
-        {
-            state.AnimateFrame();
-        }
-
-        AssertEqual((byte)0, state.CurrentAlpha);
-
-        state.UpdateTarget(isDesktop: false, isHover: false);
-
-        for (var i = 0; i < 100; i++)
-        {
-            state.AnimateFrame();
-        }
-
-        AssertEqual((byte)255, state.CurrentAlpha);
-    }),
     ("foreground desktop classes resolve to desktop", () =>
     {
         AssertEqual(ShellActivityState.Desktop, WindowClassifier.ResolveShellState("Progman", hasVisibleApplicationWindows: true));
@@ -99,6 +45,20 @@ var tests = new (string Name, Action Run)[]
 
         AssertEqual(true, WindowClassifier.IsApplicationWindow(snapshot));
     }),
+    ("typeless background process window is ignored", () =>
+    {
+        var snapshot = new WindowSnapshot(
+            ClassName: "Chrome_WidgetWin_1",
+            IsVisible: true,
+            IsMinimized: false,
+            IsCloaked: false,
+            ExStyle: 0x00040000,
+            HasOwner: false,
+            ProcessName: "Typeless",
+            TextLength: 8);
+
+        AssertEqual(false, WindowClassifier.IsApplicationWindow(snapshot));
+    }),
 };
 
 var failed = 0;
@@ -131,13 +91,5 @@ static void AssertEqual<T>(T expected, T actual)
     if (!EqualityComparer<T>.Default.Equals(expected, actual))
     {
         throw new InvalidOperationException($"Expected {expected}, got {actual}.");
-    }
-}
-
-static void AssertTrue(bool condition, string message)
-{
-    if (!condition)
-    {
-        throw new InvalidOperationException(message);
     }
 }

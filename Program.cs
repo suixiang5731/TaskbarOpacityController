@@ -1,9 +1,13 @@
 using System.Drawing;
+using System.Diagnostics;
 using System.Globalization;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Windows.Forms;
 using Microsoft.Win32;
+
+[assembly: InternalsVisibleTo("TaskbarOpacityController.Tests")]
 
 namespace TaskbarOpacityController;
 
@@ -43,6 +47,76 @@ internal static class ShellState
             or "StartMenu"
             or "NotifyIconOverflowWindow"
             or "DV2ControlHost";
+    }
+}
+
+internal enum ShellActivityState
+{
+    Desktop,
+    Active
+}
+
+internal readonly record struct WindowSnapshot(
+    string ClassName,
+    bool IsVisible,
+    bool IsMinimized,
+    bool IsCloaked,
+    int ExStyle,
+    bool HasOwner,
+    string ProcessName = "",
+    int TextLength = 1,
+    bool IsEffectivelyHidden = false);
+
+internal static class WindowClassifier
+{
+    private const int WsExToolWindow = 0x00000080;
+    private const int WsExAppWindow = 0x00040000;
+
+    public static ShellActivityState ResolveShellState(string className, bool hasVisibleApplicationWindows)
+    {
+        if (ShellState.IsDesktopClass(className))
+        {
+            return ShellActivityState.Desktop;
+        }
+
+        return ShellState.IsActiveShellClass(className) || hasVisibleApplicationWindows
+            ? ShellActivityState.Active
+            : ShellActivityState.Desktop;
+    }
+
+    public static bool IsApplicationWindow(WindowSnapshot window)
+    {
+        if (!window.IsVisible
+            || window.IsMinimized
+            || window.IsCloaked
+            || window.IsEffectivelyHidden)
+        {
+            return false;
+        }
+
+        if (ShellState.IsIgnoredShellClass(window.ClassName)
+            || ShellState.IsActiveShellClass(window.ClassName)
+            || IsIgnoredBackgroundProcess(window.ProcessName))
+        {
+            return false;
+        }
+
+        if ((window.ExStyle & WsExToolWindow) != 0 && (window.ExStyle & WsExAppWindow) == 0)
+        {
+            return false;
+        }
+
+        if (window.HasOwner && (window.ExStyle & WsExAppWindow) == 0)
+        {
+            return false;
+        }
+
+        return (window.ExStyle & WsExAppWindow) != 0 || window.TextLength > 0;
+    }
+
+    internal static bool IsIgnoredBackgroundProcess(string processName)
+    {
+        return processName.Contains("typeless", StringComparison.OrdinalIgnoreCase);
     }
 }
 
@@ -210,6 +284,7 @@ internal static class Program
 {
     private const int GwlExStyle = -20;
     private const int GwOwner = 4;
+    private const int DwmwaCloaked = 14;
     private const int WsExToolWindow = 0x00000080;
     private const int WsExAppWindow = 0x00040000;
     private const uint EventSystemForeground = 0x0003;
@@ -226,6 +301,7 @@ internal static class Program
 
     private static readonly TaskbarController Taskbar = new();
     private static readonly Rectangle[] EmptyScreenBounds = Array.Empty<Rectangle>();
+    private static readonly Dictionary<uint, bool> ignoredProcessCache = new();
 
     private static NativeMethods.WinEventDelegate? hookDelegate;
     private static IntPtr foregroundHook;
@@ -461,7 +537,7 @@ internal static class Program
             return false;
         }
 
-        if (IsEffectivelyHiddenAtScreenEdge(hwnd))
+        if (IsDwmCloaked(hwnd) || IsEffectivelyHiddenAtScreenEdge(hwnd) || IsIgnoredBackgroundProcess(hwnd))
         {
             return false;
         }
@@ -506,7 +582,14 @@ internal static class Program
         return !NativeMethods.IsWindow(hwnd)
             || !NativeMethods.IsWindowVisible(hwnd)
             || NativeMethods.IsIconic(hwnd)
+            || IsDwmCloaked(hwnd)
             || IsEffectivelyHiddenAtScreenEdge(hwnd);
+    }
+
+    private static bool IsDwmCloaked(IntPtr hwnd)
+    {
+        return NativeMethods.DwmGetWindowAttribute(hwnd, DwmwaCloaked, out var cloaked, Marshal.SizeOf<int>()) == 0
+            && cloaked != 0;
     }
 
     private static bool IsEffectivelyHiddenAtScreenEdge(IntPtr hwnd)
@@ -567,6 +650,33 @@ internal static class Program
         return NativeMethods.GetClassName(hwnd, className, className.Capacity) > 0
             ? className.ToString()
             : string.Empty;
+    }
+
+    private static bool IsIgnoredBackgroundProcess(IntPtr hwnd)
+    {
+        NativeMethods.GetWindowThreadProcessId(hwnd, out var processId);
+        if (processId == 0)
+        {
+            return false;
+        }
+
+        if (ignoredProcessCache.TryGetValue(processId, out var cached))
+        {
+            return cached;
+        }
+
+        try
+        {
+            using var process = Process.GetProcessById((int)processId);
+            var ignored = WindowClassifier.IsIgnoredBackgroundProcess(process.ProcessName);
+            ignoredProcessCache[processId] = ignored;
+            return ignored;
+        }
+        catch
+        {
+            ignoredProcessCache[processId] = false;
+            return false;
+        }
     }
 
     private static bool IsCursorInBottomBand()
@@ -699,6 +809,9 @@ internal static partial class NativeMethods
     internal static extern IntPtr GetWindow(IntPtr hWnd, int uCmd);
 
     [DllImport("user32.dll")]
+    internal static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+    [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
     internal static extern bool GetWindowRect(IntPtr hWnd, out NativeRect lpRect);
 
@@ -714,6 +827,9 @@ internal static partial class NativeMethods
     [DllImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     internal static extern bool SetLayeredWindowAttributes(IntPtr hwnd, uint crKey, byte bAlpha, uint dwFlags);
+
+    [DllImport("dwmapi.dll")]
+    internal static extern int DwmGetWindowAttribute(IntPtr hwnd, int dwAttribute, out int pvAttribute, int cbAttribute);
 
     internal struct NativeRect
     {
